@@ -1,0 +1,37 @@
+CC          = g++
+OPTIMIZE    = no
+DEBUG       = no
+
+# Standard flags
+CFLAGS := -std=c++17 -Wall -mavx -fopenmp
+
+# Linker flags
+LDFLAGS = -lm -fopenmp
+
+# Debug Flags
+ifeq ($(DEBUG),yes)
+  CFLAGS += -g
+endif
+
+# Forced to -O0
+CFLAGS += -O0
+
+all: kmeans_gemini_optimized
+
+kmeans_gemini_optimized: cluster_gemini_optimized.o getopt_gemini_optimized.o read_input_gemini_optimized.o rmse_gemini_optimized.o kmeans_gemini_optimized.o
+	$(CC) $(CFLAGS) $^ -o kmeans_gemini_optimized $(LDFLAGS)
+
+%.o: %.cpp
+	$(CC) $(CFLAGS) $< -c -o $@
+
+%.o: %.c
+	$(CC) $(CFLAGS) $< -c -o $@
+
+cluster_gemini_optimized.o: cluster_gemini_optimized.c kmeans_gemini_optimized.h
+getopt_gemini_optimized.o: getopt_gemini_optimized.c getopt_gemini_optimized.h
+read_input_gemini_optimized.o: read_input_gemini_optimized.cpp kmeans_gemini_optimized.h
+rmse_gemini_optimized.o: rmse_gemini_optimized.c kmeans_gemini_optimized.h
+kmeans_gemini_optimized.o: kmeans_gemini_optimized.c kmeans_gemini_optimized.h
+
+clean:
+	rm -f *.o kmeans_gemini_optimized

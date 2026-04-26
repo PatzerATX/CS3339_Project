@@ -1,0 +1,37 @@
+CC          = g++
+OPTIMIZE    = no
+DEBUG       = no
+
+# Standard flags
+CFLAGS := -std=c++11 -Wall -mavx -fopenmp
+
+# Linker flags
+LDFLAGS = -lm -fopenmp
+
+# Debug Flags
+ifeq ($(DEBUG),yes)
+  CFLAGS += -g -DDEBUG
+endif
+
+# Optimization Flags
+# Forced to -O0
+CFLAGS += -O0
+
+hybridsort_gemini_optimized: hybridsort_gemini_optimized.o bucketsort_gemini_optimized.o mergesort_gemini_optimized.o
+	$(CC) $(CFLAGS) -o hybridsort_gemini_optimized \
+		hybridsort_gemini_optimized.o \
+		bucketsort_gemini_optimized.o \
+		mergesort_gemini_optimized.o \
+		$(LDFLAGS)
+
+hybridsort_gemini_optimized.o: hybridsort_gemini_optimized.cpp bucketsort_gemini_optimized.h mergesort_gemini_optimized.h
+	$(CC) $(CFLAGS) -o hybridsort_gemini_optimized.o -c hybridsort_gemini_optimized.cpp
+
+bucketsort_gemini_optimized.o: bucketsort_gemini_optimized.c bucketsort_gemini_optimized.h
+	$(CC) $(CFLAGS) -o bucketsort_gemini_optimized.o -c bucketsort_gemini_optimized.c
+
+mergesort_gemini_optimized.o: mergesort_gemini_optimized.c mergesort_gemini_optimized.h
+	$(CC) $(CFLAGS) -o mergesort_gemini_optimized.o -c mergesort_gemini_optimized.c
+
+clean:
+	rm -f *.o hybridsort_gemini_optimized

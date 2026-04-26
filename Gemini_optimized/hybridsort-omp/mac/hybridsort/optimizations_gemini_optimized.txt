@@ -1,0 +1,34 @@
+Optimizations for Hybridsort (Gemini Optimized)
+Target: ARM64 Apple Silicon, Compiled at -O0
+
+1. Manual SIMD Vectorization (NEON):
+- Since the compiler is at -O0, it will not auto-vectorize. I implemented manual NEON intrinsics (vminq_f32, vmaxq_f32, etc.) for the float4 operations in mergesort (sortElem, getLowest, getHighest).
+- Used NEON to accelerate min/max calculations in the main data generation phase.
+- Reason: SIMD allows processing 4 floats simultaneously, which is critical for performance when compiler optimizations are disabled.
+
+2. Thread-Local Storage for Histograms:
+- Replaced global atomic updates in the histogram phase with thread-local histograms.
+- Each OpenMP thread calculates its own histogram, which are then reduced in a single critical section.
+- Reason: Atomics are expensive, especially when multiple threads compete for the same bins. Thread-local storage eliminates contention.
+
+3. Parallelization with OpenMP (CPU-targeted):
+- Replaced "OpenMP Target" (GPU-centric) with standard CPU-based OpenMP (#pragma omp parallel for).
+- Distributed bucket assignment and merging across all available CPU cores.
+- Reason: The target is CPU execution. OpenMP Target on CPU has significant runtime overhead compared to native OpenMP.
+
+4. Unrolled Binary Search:
+- Manually unrolled the binary search used for bucket assignment in bucketsort.
+- Reason: At -O0, the compiler will not unroll loops. Manual unrolling reduces branch overhead and improves instruction flow.
+
+5. Cache-Friendly Memory Allocation:
+- Used aligned_alloc(128, ...) to align data to the 128-byte cache line size of Apple Silicon.
+- Structured the merge sort to process buckets in a way that respects the L1/L2 cache hierarchy.
+- Reason: Alignment prevents cache line splitting and improves memory throughput.
+
+6. Reduced Branching:
+- Optimized conditional logic in the merge sort pass to use fewer branches and more predictable execution paths.
+- Reason: Branch mispredictions are costly on deep pipelines like Apple Silicon.
+
+7. Unified Memory Optimization:
+- Eliminated redundant memory copies (target update) that were necessary for GPU offloading but are overhead on unified memory CPU architectures.
+- Reason: Direct memory access is faster on ARM64 unified memory.

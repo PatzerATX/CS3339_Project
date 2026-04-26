@@ -1,0 +1,28 @@
+Optimizations for K-Means (Gemini Optimized)
+Target: x86_64, Compiled at -O0
+
+1. Manual SIMD Vectorization (SSE/AVX):
+- Implemented `euclid_dist_2_sse` using manual SSE/AVX intrinsics (_mm_load_ps, _mm_sub_ps, _mm_mul_ps, _mm_add_ps).
+- Processes 4 floats simultaneously per core.
+- Reason: At -O0, the compiler will not auto-vectorize the performance-critical distance calculation. Manual implementation is required to utilize the processor's vector units.
+
+2. NUMA-Aware Memory Initialization (First-Touch):
+- Parallelized the initial feature data copy using OpenMP.
+- Reason: On x86 multi-socket systems with 2 NUMA nodes, data is allocated on the node of the thread that first touches (writes) it. This distributes memory bandwidth requirements and reduces latency for the subsequent parallel clustering phase.
+
+3. Parallel Centroid Update with Local Buffers:
+- Each OpenMP thread now accumulates its assigned points into private local buffers.
+- The global centroids are updated only once per thread in a critical section.
+- Reason: Eliminates atomic contention and cache line bouncing (false sharing) between threads on different cores/nodes, which is highly inefficient at -O0.
+
+4. Cache-Line Alignment (64-byte):
+- Used `_mm_malloc` and `aligned_alloc` to ensure all major data structures (features, clusters) are 64-byte aligned.
+- Reason: Aligns data with the x86_64 cache line size, preventing performance penalties from cache line splits and optimizing L1/L2 access.
+
+5. CPU-Native OpenMP Parallelization:
+- Replaced the high-overhead "OpenMP Target" (GPU offload) with standard CPU OpenMP.
+- Reason: Native OpenMP is significantly faster than the offloading runtime when executing on a CPU target, especially at -O0.
+
+6. Manual Loop Unrolling:
+- Manually unrolled the innermost loops of the distance calculation by a factor of 4.
+- Reason: At -O0, the compiler does not perform loop unrolling. Manual unrolling reduces the relative overhead of branch and increment instructions.

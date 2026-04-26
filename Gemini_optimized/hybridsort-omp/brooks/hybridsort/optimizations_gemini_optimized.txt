@@ -1,0 +1,32 @@
+Optimizations for Hybridsort (Gemini Optimized)
+Target: x86_64, Compiled at -O0
+
+1. Manual SIMD Vectorization (SSE/AVX):
+- Implemented manual SSE/AVX intrinsics (_mm_min_ps, _mm_max_ps, _mm_shuffle_ps) for the float4 operations in mergesort.
+- Used vectorized min/max calculations in the main data initialization phase.
+- Reason: At -O0, the compiler will not auto-vectorize. Manual SIMD is essential to use the hardware's execution units for processing 4 floats at once.
+
+2. NUMA-Aware Memory Initialization (First-Touch):
+- Parallelized the initial data generation loop using OpenMP.
+- Reason: On a 2-node NUMA architecture, memory is allocated on the node of the thread that first writes to it ("first-touch"). Parallel initialization ensures data is distributed across NUMA nodes, reducing memory bus contention.
+
+3. Parallelization with OpenMP (CPU-targeted):
+- Replaced "OpenMP Target" with native CPU OpenMP (#pragma omp parallel for).
+- Distributed bucket assignment and merging across all available x86 cores.
+- Reason: Native OpenMP has significantly lower overhead than the GPU offloading layer when running on a CPU target.
+
+4. Cache-Line Alignment (64 bytes):
+- Used `_mm_malloc(..., 64)` and `aligned_alloc` to align major buffers and the thread-local histogram storage to 64-byte boundaries.
+- Reason: x86_64 uses 64-byte cache lines. Proper alignment prevents cache line splitting, which is a major performance bottleneck at -O0.
+
+5. Thread-Local Storage for Histograms:
+- Replaced global atomic updates with per-thread histograms.
+- Reason: Eliminates atomic contention between threads, which is particularly expensive on multi-socket x86 systems.
+
+6. Unrolled Binary Search:
+- Manually unrolled the binary search for bucket assignment.
+- Reason: At -O0, the compiler will not perform loop unrolling. Manual unrolling reduces branch overhead and instruction count.
+
+7. Unified L3 Cache Utilization:
+- Structured the merge sort and bucket sorting to work within the 512MB L3 cache as much as possible, though the large dataset size (50M floats ~200MB) still hits L3 frequently.
+- Reason: Efficiently utilizing the shared L3 cache reduces the frequency of expensive main memory (DRAM) accesses.

@@ -1,0 +1,30 @@
+Optimizations for K-Means (Gemini Optimized)
+Target: ARM64 Apple Silicon, Compiled at -O0
+
+1. Manual SIMD Vectorization (NEON):
+- Implemented `euclid_dist_2_neon` using manual NEON intrinsics (vld1q_f32, vsubq_f32, vfmaq_f32).
+- This replaces the scalar distance loop with a vectorized version that processes 4 floats per instruction.
+- Reason: At -O0, the compiler will not auto-vectorize. Manual SIMD is the only way to utilize the hardware's vector units for the performance-critical distance calculations.
+
+2. Parallel Point Assignment (OpenMP):
+- Parallelized the core "Point-to-Cluster" assignment loop using OpenMP.
+- Used a reduction clause for the 'delta' variable to ensure thread safety without atomic overhead.
+- Reason: K-Means point assignment is embarrassingly parallel. Distributing this work across all CPU cores provides the most significant speedup on multi-core ARM64 processors.
+
+3. Parallel Centroid Update with Local Buffers:
+- Implemented a parallel centroid update using thread-local accumulation buffers.
+- Each thread accumulates its assigned points locally, and then merges into the global centroids in a critical section.
+- Reason: Direct atomic updates to global centroids would cause massive cache contention and pipeline stalls. Local buffers ensure threads can work independently.
+
+4. Manual Loop Unrolling in Distance Calculation:
+- The NEON distance function processes 4-float chunks, effectively unrolling the most inner loop by 4x.
+- Reason: Disabling compiler optimizations (-O0) prevents loop unrolling. Manual unrolling reduces branch overhead and instruction count.
+
+5. Unified Memory & Cache Considerations:
+- Designed the parallel loops to process contiguous chunks of points.
+- Reason: This improves cache locality and leverages the high memory bandwidth of the Apple Silicon unified memory architecture.
+
+6. Strength Reduction and Branch Optimization:
+- Simplified the distance logic to avoid redundant calculations inside the inner loops.
+- Replaced the GPU-centric OpenMP Target logic with native CPU OpenMP.
+- Reason: CPU-native OpenMP has much lower overhead than GPU offloading layers when running on a CPU target, especially at -O0.

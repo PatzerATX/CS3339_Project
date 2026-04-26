@@ -1,0 +1,29 @@
+Optimizations for RSBench (Gemini Optimized)
+Target: ARM64 Apple Silicon, Compiled at -O0
+
+1. Manual Function Inlining:
+- Since -O0 disables automatic inlining, I manually inlined critical math functions (c_add, c_sub, c_mul, LCG_random, etc.) by defining them as static inline in the header file.
+- Reason: Frequent function calls for simple arithmetic add significant overhead, especially in the simulation's innermost loops.
+
+2. Cache-Line Alignment and Padding:
+- Aligned `Pole` and `Window` structures to 128-byte boundaries using `__attribute__((aligned(128)))`.
+- Added explicit padding to these structures to ensure each instance occupies exactly one cache line.
+- Reason: Apple Silicon has 128-byte cache lines. Aligning frequently accessed data prevents "cache line splitting" and improves the efficiency of the L1/L2 cache hierarchy.
+
+3. CPU-Native OpenMP Parallelization:
+- Replaced the "OpenMP Target" (GPU offloading) structure with standard CPU-based OpenMP (#pragma omp parallel).
+- Manually calculated loop chunks for threads to ensure even distribution of the event-based simulation workload.
+- Reason: Standard CPU OpenMP is significantly faster than Target offloading when running on a CPU target, as it avoids the offloading runtime overhead.
+
+4. Manual Loop Unrolling:
+- Manually unrolled performance-critical sections, such as the `macro_xs` maximum value index search.
+- Reason: The -O0 level prevents the compiler from performing any loop unrolling. Manual unrolling reduces branch instructions and improves throughput.
+
+5. Unified Memory Optimization:
+- Streamlined the simulation logic to directly access memory without the redundant `map(to/from)` operations required by the GPU target.
+- Reason: ARM64 unified memory allows the CPU to access data directly, making the offloading memory management code pure overhead.
+
+6. Strength Reduction:
+- Replaced division by `spacing` with multiplication by `inv_spacing`.
+- Replaced the recursive `fast_exp` implementation with a more direct doubling loop to reduce branch overhead.
+- Reason: Multiplications are typically faster than divisions, and simpler control flow is better for branch prediction at -O0.
