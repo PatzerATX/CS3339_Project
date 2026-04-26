@@ -1,0 +1,19 @@
+Optimizations made in x86/rsbench_GPT5_optimized
+
+1. Replaced the OpenMP target/offload path in `run_event_based_simulation` with a CPU-resident event loop.
+Reason: the requested target is x86_64 CPU execution. At `-O0`, offload mapping, target setup, and reduction machinery add overhead that does not benefit the requested CPU architecture.
+
+2. Hoisted frequently used simulation pointers and size fields out of the main lookup loop.
+Reason: reducing repeated structure dereferences lowers instruction count in the hottest path, which matters more when compiling without optimizer help.
+
+3. Simplified the 4-way macro XS maximum search and the 4-component accumulation in `calculate_macro_xs`.
+Reason: fixed-size unrolling removes loop overhead and branch work from a path executed on every lookup.
+
+4. Hoisted repeated base-index and concentration loads in `calculate_macro_xs`, and hoisted `sqrt(E)` plus the pseudo-K0RS base index in `calculate_sig_T`.
+Reason: this cuts repeated indexing and transcendental setup from inner loops while preserving identical numerical behavior.
+
+5. Removed the OpenMP dependency from the optimized build and switched timing to `gettimeofday`-based wall clock timing.
+Reason: the optimized copy targets CPU-only execution and should build cleanly with the system `clang` toolchain on x86_64 at `-O0`.
+
+6. Updated the optimized `Makefile` to build with `clang`, CPU execution, and `-O0`.
+Reason: this keeps the existing build flow intact while matching the requested x86_64 CPU target and optimization level.

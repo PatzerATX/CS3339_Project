@@ -1,0 +1,19 @@
+Optimizations made in x86/srad_GPT5_optimized
+
+1. Replaced the OpenMP target/offload path in `main.c` with CPU-resident loops.
+Reason: the requested target is x86_64 CPU execution. At `-O0`, target mapping, teams setup, and update directives add overhead that does not help the requested CPU architecture.
+
+2. Replaced the multi-stage manual reduction kernel with a direct CPU accumulation of sum and sum-of-squares.
+Reason: on CPU at `-O0`, the original block-reduction machinery adds synchronization and indexing overhead. A single linear pass is more cache-friendly and cheaper on branch-predicted scalar cores.
+
+3. Rewrote the SRAD stencil using nested column/row loops with cached column offsets.
+Reason: the image is stored in column-major order, so iterating by column then row improves locality and reduces repeated row/column reconstruction work in the hottest loops.
+
+4. Kept the same numerical SRAD pipeline and diffusion buffers.
+Reason: this preserves the algorithm’s functionality and output behavior while removing only the GPU-specific execution overhead.
+
+5. Updated the optimized `Makefile` to use `clang`, CPU execution, and `-O0` across all compilation units.
+Reason: this keeps the existing build process intact while matching the requested x86_64 CPU target and optimization level.
+
+6. Changed the optimized copy to read the local benchmark input image and adjusted `make clean` to preserve that input asset.
+Reason: the benchmark folder already contains `image.pgm`; using the local file keeps the optimized copy self-contained and avoids deleting the input image during cleanup.

@@ -1,0 +1,38 @@
+Single optimization pass for ARM64 Apple Silicon CPU at -O0
+
+Files optimized:
+- benchmark_Codex_optimized_cluster.c
+- benchmark_Codex_optimized_read_input.c
+- benchmark_Codex_optimized_rmse.c
+- benchmark_Codex_optimized_kmeans.c
+- benchmark_Codex_optimized_kmeans.h
+- Makefile
+
+Optimizations made:
+1. Removed GPU-target OpenMP offload path from the hot clustering loop and used a direct CPU execution path.
+Reason: the target architecture is Apple Silicon CPU, and the original offload-oriented path adds overhead and is not appropriate for the requested CPU-only build.
+
+2. Flattened and reused cluster/new-center storage per cluster-count iteration.
+Reason: reduces allocator overhead and improves spatial locality for ARM64 caches at -O0.
+
+3. Replaced repeated scalar initialization loops with memset/memcpy where safe.
+Reason: library implementations are usually faster than naive scalar loops at -O0 and preserve exact contents.
+
+4. Hoisted invariant pointer arithmetic and reused row pointers inside the inner distance loops.
+Reason: reduces repeated address calculations that the compiler may not eliminate at -O0.
+
+5. Replaced repeated divisions during centroid updates with one reciprocal multiply per cluster.
+Reason: division is expensive at -O0; multiplying by a precomputed reciprocal preserves the same mathematical result structure while reducing runtime cost.
+
+6. Simplified RMSE helper loops and used sqrtf.
+Reason: keeps the computation in float precision and reduces unnecessary conversions on ARM64.
+
+7. Added an Apple-Silicon-friendly Makefile that preserves the same make-driven workflow while compiling the renamed source set at -O0.
+Reason: the original Makefile targeted Intel oneAPI/OpenMP offload and was not suitable for the requested ARM64 CPU target.
+
+Behavior preserved:
+- Same command-line interface
+- Same input/output behavior
+- Same random seed
+- Same printed result format
+- No external dependencies added

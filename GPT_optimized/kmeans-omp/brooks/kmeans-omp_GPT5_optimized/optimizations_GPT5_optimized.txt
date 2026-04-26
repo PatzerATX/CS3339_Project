@@ -1,0 +1,22 @@
+Optimizations made in kmeans-omp_GPT5_optimized
+
+1. Replaced the OpenMP target/offload work in `cluster.c` with CPU-resident loops.
+Reason: the requested target is x86_64 CPU execution. At `-O0`, offload mapping, target updates, and team setup add substantial overhead and do not benefit the requested CPU architecture.
+
+2. Removed the transposed `feature_swap` buffer from the hot assignment loop.
+Reason: the feature matrix is already stored contiguously per point. Using that row-major layout avoids an extra `O(npoints * nfeatures)` transpose for every tested cluster count and improves cache locality on 64-byte cache lines.
+
+3. Reused `new_centers` and `new_centers_len` across loop trials for each cluster count.
+Reason: avoiding repeated allocation and free calls reduces runtime overhead at `-O0` while preserving the same k-means update behavior.
+
+4. Rewrote the distance calculations with direct pointer arithmetic and cached row pointers.
+Reason: this reduces repeated indexing arithmetic and pointer indirection in the hottest nested loops, which matters more when compiling without optimizer help.
+
+5. Replaced the OpenMP-parallel RMSE loop with a deterministic CPU loop.
+Reason: the optimized build is CPU-only and does not require OpenMP runtime support. The sequential loop preserves the RMSE calculation while avoiding parallel setup overhead for small and medium runs.
+
+6. Replaced the legacy bundled `getopt.c` body with a compatibility unit that uses the platform C library `getopt`.
+Reason: the original K&R-style implementation is problematic in the current C++-style build flow. Using the platform-provided `getopt` preserves command-line behavior without adding any external dependency.
+
+7. Updated the optimized `Makefile` to build with `clang++`, CPU execution, and `-O0`.
+Reason: this keeps the existing build flow intact while matching the requested x86_64 CPU target and optimization level.
