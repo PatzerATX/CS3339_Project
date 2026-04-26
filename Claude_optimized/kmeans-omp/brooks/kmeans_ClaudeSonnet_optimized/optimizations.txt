@@ -1,0 +1,207 @@
+================================================================================
+kmeans_ClaudeSonnet_optimized — Optimization Report
+Target: x86_64, compiled at -O0
+================================================================================
+
+At -O0 the compiler performs no automatic optimization: every C expression maps
+directly to load/store instructions, no CSE, no loop invariant code motion, no
+register allocation beyond the bare minimum.  The strategy is to make the source
+code itself do the work the compiler refuses to do at -O0.
+
+All optimizations are in cluster.c and rmse.c.  The remaining files
+(kmeans.c, kmeans.h, read_input.c, getopt.c, getopt.h) are unchanged.
+
+--------------------------------------------------------------------------------
+FILE: cluster.c
+--------------------------------------------------------------------------------
+
+1. ELIMINATE DUPLICATE ARRAY LOAD IN INNER DISTANCE LOOP
+   Original:
+       ans += (feature_swap[l*npoints+point_id] - cluster[i*nfeatures+l]) *
+              (feature_swap[l*npoints+point_id] - cluster[i*nfeatures+l]);
+   Optimized:
+       float fval = feature_swap[l * npoints + point_id];
+       float diff = fval - cluster[cluster_base + l];
+       ans += diff * diff;
+
+   Reason: At -O0, each array subscript expression is re-evaluated as a full
+   memory load.  The original reads feature_swap[l*npoints+point_id] twice per
+   inner iteration (once per operand of the multiply), plus recomputes the index
+   expression twice.  Caching in fval and diff halves the loads and index
+   arithmetic for this access.  This is the innermost loop of the entire program
+   and the single highest-impact change.
+
+2. PRECOMPUTE CLUSTER ROW BASE OFFSET OUTSIDE INNER FEATURE LOOP
+   Original: cluster[i*nfeatures+l]  (i*nfeatures recomputed every l iteration)
+   Optimized:
+       int cluster_base = i * nfeatures;   // hoisted outside l loop
+       ...cluster[cluster_base + l]
+
+   Reason: At -O0, i*nfeatures is a multiply executed nfeatures times per
+   cluster candidate.  Moving it outside the l loop reduces it to once per
+   cluster candidate (nclusters times per point), saving nfeatures multiplies
+   per cluster per point.
+
+3. REPLACE DEAD dist VARIABLE WITH DIRECT ans COMPARISON
+   Original:
+       float dist = 0;
+       float ans  = 0;
+       ...
+       dist = ans;
+       if (dist < min_dist) { ... }
+   Optimized:
+       float ans = 0.0f;
+       ...
+       if (ans < min_dist) { ... }
+
+   Reason: dist was only ever assigned from ans immediately before the compare,
+   making it a dead write.  At -O0 this extra store+load pair is not elided.
+   Removing it saves one store and one load per cluster candidate per point.
+
+4. USE LOCAL best_index INSTEAD OF OUTER-SCOPE index IN PARALLEL LOOP
+   Original:  index = i;  (writes to outer-scope variable every update)
+   Optimized: best_index = i;  then membership_OCL[point_id] = best_index;
+
+   Reason: At -O0 the outer index variable lives at a fixed stack address.
+   Using a loop-local best_index lets the compiler allocate it closer (or
+   keep it in a register in practice), avoids any confusion with the outer
+   return-value use of index, and makes the intent of the parallel loop
+   explicit and race-free.
+
+5. CACHE membership_OCL[i] AS cluster_id AND USE IT CONSISTENTLY
+   Original:
+       int cluster_id = membership_OCL[i];
+       new_centers_len[cluster_id]++;
+       if (membership_OCL[i] != membership[i]) { ... }   // second load
+   Optimized:
+       int cluster_id = membership_OCL[i];
+       new_centers_len[cluster_id]++;
+       if (cluster_id != membership[i]) { ... }           // reuse local
+
+   Reason: The original loads membership_OCL[i] a second time for the
+   comparison.  At -O0 this is a real memory access.  Using cluster_id
+   (already in a local) eliminates that redundant load.
+
+6. CACHE ROW POINTERS IN THE MEMBERSHIP UPDATE ACCUMULATION LOOP
+   Original:
+       for (int j = 0; j < nfeatures; j++)
+           new_centers[cluster_id][j] += features[i][j];
+   Optimized:
+       float *nc     = new_centers[cluster_id];
+       float *feat_i = features[i];
+       for (int j = 0; j < nfeatures; j++)
+           nc[j] += feat_i[j];
+
+   Reason: new_centers[cluster_id] and features[i] are pointer-of-pointer
+   dereferences.  At -O0 each access to new_centers[cluster_id][j] performs
+   two loads: the outer pointer and the inner element.  Caching the row
+   pointer in nc/feat_i reduces this to one outer load per point (outside
+   the j loop) plus one inner load per feature.
+
+7. HOIST new_centers_len[i] > 0 CHECK OUTSIDE INNER FEATURE LOOP AND CACHE POINTERS
+   Original:
+       for (int i=0; i<nclusters; i++) {
+           for (int j=0; j<nfeatures; j++) {
+               if (new_centers_len[i] > 0)
+                   clusters[i][j] = new_centers[i][j] / new_centers_len[i];
+               new_centers[i][j] = 0.0;
+           }
+           new_centers_len[i] = 0;
+       }
+   Optimized:
+       float *ci  = clusters[i];
+       float *nci = new_centers[i];
+       int ncl    = new_centers_len[i];
+       if (ncl > 0) {
+           float inv_len = 1.0f / (float)ncl;
+           for (int j = 0; j < nfeatures; j++) {
+               ci[j]  = nci[j] * inv_len;
+               nci[j] = 0.0f;
+           }
+       } else {
+           for (int j = 0; j < nfeatures; j++) nci[j] = 0.0f;
+       }
+
+   Reason: (a) The branch new_centers_len[i] > 0 is loop-invariant w.r.t. j;
+   at -O0 it was re-evaluated and the same load issued nfeatures times.
+   (b) Pointer-of-pointer loads for clusters[i] and new_centers[i] were
+   re-issued every j iteration.  Caching them saves 2*nfeatures pointer loads
+   per cluster center.
+
+8. REPLACE DIVISION WITH RECIPROCAL MULTIPLY FOR CLUSTER CENTER NORMALIZATION
+   Original:  clusters[i][j] = new_centers[i][j] / new_centers_len[i];
+   Optimized:
+       float inv_len = 1.0f / (float)ncl;   // one division per cluster
+       ci[j] = nci[j] * inv_len;            // multiply per feature
+
+   Reason: Integer division (or int→float then float division) is 20-40x more
+   expensive than floating-point multiply on x86.  Computing the reciprocal
+   once per cluster and multiplying per feature reduces the number of division
+   operations from nclusters*nfeatures to nclusters.
+
+9. CACHE tid*nfeatures IN THE TRANSPOSE LOOP
+   Original:  feature[tid * nfeatures + i]   (tid*nfeatures recomputed each i)
+   Optimized:
+       int tid_base = tid * nfeatures;
+       feature[tid_base + i]
+
+   Reason: Same class of loop-invariant multiply elimination as #2.
+
+10. CACHE CLUSTER INIT SOURCE AND DESTINATION POINTERS
+    Original:  clusters[i][j] = features[initial[n]][j]  (two pointer derefs per j)
+    Optimized:
+        float *src  = features[initial[n]];
+        float *dest = clusters[i];
+        dest[j] = src[j];
+
+    Reason: Eliminates the repeated outer pointer dereferences inside the j loop.
+
+--------------------------------------------------------------------------------
+FILE: rmse.c
+--------------------------------------------------------------------------------
+
+11. CACHE DIFFERENCE IN euclid_dist_2 TO ELIMINATE DOUBLE COMPUTATION
+    Original:
+        ans += (pt1[i]-pt2[i]) * (pt1[i]-pt2[i]);
+    Optimized:
+        float diff = pt1[i] - pt2[i];
+        ans += diff * diff;
+
+    Reason: At -O0, pt1[i] and pt2[i] are each loaded twice and the subtraction
+    computed twice.  Caching in diff halves the loads and arithmetic per feature.
+
+12. CACHE feature[i] POINTER IN rms_err
+    Original:
+        nearest_cluster_index = find_nearest_point(feature[i], ...);
+        sum_euclid += euclid_dist_2(feature[i], ...);
+    Optimized:
+        float *feat_i = feature[i];
+        nearest_cluster_index = find_nearest_point(feat_i, ...);
+        sum_euclid += euclid_dist_2(feat_i, ...);
+
+    Reason: feature[i] is a pointer-of-pointer dereference issued twice per
+    iteration.  Caching eliminates one redundant outer load.
+
+--------------------------------------------------------------------------------
+FILE: Makefile
+--------------------------------------------------------------------------------
+
+13. EXPLICIT -O0 FLAG AND DEVICE=cpu
+    Changed OPTIMIZE=yes (-O3) to OPTIMIZE=no, added -O0 explicitly to CFLAGS,
+    and set DEVICE=cpu so the OpenMP CPU path (-qopenmp) is selected instead
+    of the GPU offload path.
+
+    Reason: The task targets CPU execution at -O0.  Using -O3 would invalidate
+    the manual optimizations (the compiler would do them automatically anyway).
+    The CPU device flag avoids unnecessary GPU offload infrastructure.
+
+================================================================================
+Summary of optimization categories applied:
+  - Redundant load elimination (items 1, 5, 11, 12)
+  - Loop-invariant computation hoisting (items 2, 7, 9)
+  - Dead variable elimination (item 3)
+  - Pointer indirection caching (items 6, 7, 10)
+  - Arithmetic strength reduction: division → reciprocal multiply (item 8)
+  - Branch hoisting outside inner loop (item 7)
+  - Local variable use to clarify intent in parallel region (item 4)
+================================================================================

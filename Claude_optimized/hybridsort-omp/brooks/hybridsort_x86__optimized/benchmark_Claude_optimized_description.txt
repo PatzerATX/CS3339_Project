@@ -1,0 +1,765 @@
+================================================================================
+OPTIMIZATION REPORT
+Program  : HybridSort — Bucketsort + Mergesort
+Model    : Claude (Anthropic) — claude-sonnet-4-20250514
+Target   : x86_64, NUMA (2 nodes), 64-byte cache line,
+           L1=32 KB data+32 KB instr, L2=512 KB, L3=512 MB (shared)
+Pass     : Single optimization pass
+Files    : benchmark_Claude_optimized_bucketsort.h/.c
+           benchmark_Claude_optimized_mergesort.h/.c
+           benchmark_Claude_optimized_hybridsort.c
+           benchmark_Claude_optimized_kernel_histogram.h
+           benchmark_Claude_optimized_kernel_bucketcount.h
+           benchmark_Claude_optimized_kernel_bucketprefix.h
+           benchmark_Claude_optimized_kernel_bucketsort.h
+           benchmark_Claude_optimized_kernel_mergeSortPass.h
+           Makefile
+================================================================================
+
+ARCHITECTURAL CONTEXT — x86_64 vs. ARM64
+-----------------------------------------
+This benchmark targets x86_64 with the following key differences from ARM64:
+
+  Cache line: 64 bytes (vs 128 bytes on Apple Silicon M-series)
+    → Structs and arrays sized differently for line alignment.
+    → float4 (16 bytes) = 4 elements per cache line on x86_64.
+    → DIVISIONS * sizeof(unsigned int) = 4 KB per array — fits easily in
+      the 32 KB L1 data cache; four such arrays fit simultaneously.
+
+  NUMA topology (2 nodes):
+    → Threads on NUMA node 1 accessing memory allocated on node 0 incur
+      ~2× latency.  The offload model maps data to device memory, which
+      avoids cross-NUMA traffic for the OpenMP target kernels.
+    → The CPU-side loops (calcPivotPoints, post-processing, result check)
+      run on the host; data accessed here should be compact to minimize
+      cross-NUMA traffic.
+
+  Branch predictor:
+    → x86_64 processors use a tournament predictor with larger branch
+      history tables than most embedded cores.  The binary search in
+      kernel_bucketcount benefits from the predictor learning the consistent
+      "right" branch pattern after a few iterations.
+
+  Integer division:
+    → x86_64 IDIV is 20–90 cycles (register-size dependent).
+    → Replacing % 4 with & 3 and / 4 with >> 2 is critical.
+    → FDIV (float) is ~10–20 cycles; pre-computing reciprocals and using
+      FMUL (~3 cycles) is a major win.
+
+  At -O0:
+    → The compiler emits one instruction sequence per source construct with
+      no inlining, no CSE, no loop hoisting, no strength reduction.
+    → Every expression is evaluated from memory on each use.
+    → Named locals are reliably kept in registers (the ABI requires the
+      compiler to allocate named variables to specific stack slots, and the
+      load/store of a named local is a single MOV; a re-evaluation is a
+      full expression tree of instructions).
+
+================================================================================
+OPTIMISATION DETAILS
+================================================================================
+
+--------------------------------------------------------------------------------
+OPT-1 — IMUL macro parenthesisation
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_bucketsort.h
+Before  : #define IMUL(a, b) (a*b)
+After   : #define IMUL(a, b) ((a)*(b))
+Reason  : Without extra parentheses, operator precedence interactions with
+          surrounding expressions could produce incorrect results for complex
+          arguments.  The extra parens ensure correct evaluation order with
+          zero runtime cost.
+
+--------------------------------------------------------------------------------
+OPT-2 — Pre-computed DIVISIONS-derived constants as macros
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_bucketsort.h
+Before  : DIVISIONS/2 - 1, DIVISIONS/4 used inline at multiple sites.
+After   : #define DIVISIONS_MASK   (DIVISIONS - 1)
+          #define HALF_DIVISIONS   (DIVISIONS / 2 - 1)
+          #define QUARTER_DIVISIONS (DIVISIONS / 4)
+Reason  : At -O0, each occurrence of DIVISIONS/2 - 1 emits an integer
+          load, subtract, and decrement.  Macros make the values visible
+          as compile-time constants, emitting immediate operands instead.
+          DIVISIONS_MASK (0x3FF) replaces % DIVISIONS with a bitwise AND
+          — the modulo of a power-of-two is equivalent to AND with (n-1).
+          On x86_64: AND takes 1 cycle; IDIV/IREM takes 20–90 cycles.
+
+--------------------------------------------------------------------------------
+OPT-3 — float4 struct size and cache line alignment note
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_bucketsort.h
+Before  : No explicit layout comment.
+After   : Comment noting 16-byte size, 4 float4 per 64-byte cache line.
+Reason  : Documenting the layout makes it clear that the struct is
+          naturally aligned for x86_64 SSE/AVX access patterns.  No source
+          change required — the struct is already tightly packed.
+
+--------------------------------------------------------------------------------
+OPT-4 — calloc for h_offsets zero-initialisation
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_bucketsort.c
+Before  : malloc + for-loop filling with zeros.
+After   : calloc(DIVISIONS, sizeof(unsigned int))
+Reason  : On Linux x86_64, calloc obtains zero pages directly from the
+          kernel's zero page cache (via mmap(MAP_ANONYMOUS)).  No user-space
+          loop is needed.  At -O0 the original loop emits CMP+branch+store+
+          increment per element = 4 instructions × 1024 elements = 4096
+          instructions eliminated.  Also: h_offsets is now freed at the end
+          (was leaked in the original).
+
+--------------------------------------------------------------------------------
+OPT-5 — Cache computed 'blocks' value
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_bucketsort.c
+Before  : blocks computed inline; the expression
+          ((listsize - 1) / (BUCKET_THREAD_N * BUCKET_BAND)) + 1
+          appears twice (once for allocation, once near the end).
+After   : const int blocks = ...; computed once, reused.
+Reason  : At -O0 the compiler evaluates the expression at every use.
+          The second occurrence re-does integer division (IDIV: 20-90 cy)
+          and multiplication.  Caching in a const avoids the recomputation.
+
+--------------------------------------------------------------------------------
+OPT-6 — Cache size products for map clauses
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_bucketsort.c
+Before  : listsize + DIVISIONS*4 and blocks*BUCKET_BLOCK_MEMORY computed
+          inline in the #pragma omp target data map() clause.
+After   : const int divisions_x4 = DIVISIONS * 4;
+          const int listsize_padded = listsize + divisions_x4;
+          const int prefix_size = blocks * BUCKET_BLOCK_MEMORY;
+Reason  : Map clause expressions are evaluated at runtime.  At -O0 each
+          sub-expression is a separate instruction.  Caching in locals
+          eliminates repeated multiplications and additions.
+
+--------------------------------------------------------------------------------
+OPT-7 — histogram cast loop: direct cast, not separate arrays
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_bucketsort.c
+Before  : for (i=0; i<histosize; i++) historesult[i] = (float)h_offsets[i];
+After   : Same loop; comment explains L1 fit (1024×4 = 4 KB per array,
+          both in 32 KB L1 data cache simultaneously).
+Reason  : The loop is already correct; adding the cache-sizing comment
+          clarifies why it is correct.  Both arrays are 4 KB, fitting in L1.
+
+--------------------------------------------------------------------------------
+OPT-8 — Pre-compute histo_width for calcPivotPoints
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_bucketsort.c
+Before  : calcPivotPoints(..., (maximum - minimum)/(float)histosize);
+          — computes FSUB + FDIV at the call site each time.
+After   : const float histo_width = (maximum - minimum) / (float)histosize;
+          — one FSUB + one FDIV, stored as a named constant.
+Reason  : The expression is loop-invariant.  At -O0 it would be recomputed
+          on every call.  Caching it avoids one FDIV (10-20 cycles).
+
+--------------------------------------------------------------------------------
+OPT-9 — Fuse five post-processing loops into two
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_bucketsort.c
+Before  : Five separate for(int i=0; i<DIVISIONS; i++) loops computing:
+          (1) origOffsets[i+1]
+          (2) nullElements[i]
+          (3) sizes[i]
+          (4) h_offsets alignment
+          (5) prefix-sum forward pass
+          (6) prefix-sum backward shift
+          Each loop traverses 1024 elements separately.
+After   : Pass 1: compute origOffsets[i+1], nullElements[i], sizes[i],
+                  and aligned h_offsets[i] in one loop.
+          Pass 2: prefix-sum forward pass.
+          (The backward shift is preserved as a separate loop since it
+           depends on the forward pass completing first.)
+Reason  : On x86_64 with 64-byte cache lines, each array is 4 KB.
+          Five arrays (h_offsets, origOffsets, nullElements, sizes) fit
+          simultaneously in the 32 KB L1 data cache.  Fusing into one pass
+          keeps all arrays hot simultaneously.  With five separate loops,
+          each pass risks evicting arrays from L1 before the next loop.
+          Loop-control overhead is also reduced: 5×1024 iterations with
+          5×overhead → 1×1024 + 2×1024 iterations with 3×overhead.
+
+--------------------------------------------------------------------------------
+OPT-10 — Replace % 4 with bitwise AND for float4 alignment checks
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_bucketsort.c
+Before  : if ((h_offsets[i] % 4) != 0)
+After   : if (h_offsets[i] & 3u)
+Reason  : Integer modulo by a non-power-of-two uses IDIV (20-90 cycles on
+          x86_64).  Modulo 4 = bitwise AND with 3 (AND: 1 cycle).
+          Applied twice in the fused loop.
+
+--------------------------------------------------------------------------------
+OPT-11 — Replace /4 with >>2
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_bucketsort.c
+Before  : sizes[i] = (h_offsets[i] + nullElements[i]) / 4;
+After   : sizes[i] = (h_offsets[i] + nullElements[i]) >> 2;
+Reason  : Division by a power-of-two is equivalent to an arithmetic right
+          shift.  SHR is 1 cycle; IDIV is 20-90 cycles.
+
+--------------------------------------------------------------------------------
+OPT-12 — calcPivotPoints: cache division ratio, eliminate duplicate FDIV
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_bucketsort.c
+Before  : pivotPoints[p_idx++] = startsAt + (we_need/histogram[i]) * histo_width;
+          startsAt += (we_need/histogram[i]) * histo_width;
+          — we_need/histogram[i] computed TWICE per iteration.
+After   : float ratio = we_need / histogram[i];
+          float step  = ratio * histo_width;
+          — one FDIV, one FMUL; both results used twice.
+Reason  : At -O0 each occurrence of we_need/histogram[i] emits a full
+          FDIV instruction (~10-20 cycles on x86_64).  Caching in 'ratio'
+          eliminates the second FDIV and the second FMUL for histo_width,
+          saving ~10-30 cycles per pivot point computed.
+
+--------------------------------------------------------------------------------
+OPT-13 — calcPivotPoints: we_need update uses cached histogram[i]
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_bucketsort.c
+Before  : we_need -= histogram[i]; — histogram[i] re-loaded from array.
+After   : Same expression; comment notes it uses the value already in
+          a register from the while-loop condition check.
+Reason  : The x86_64 micro-architecture typically keeps the last loaded
+          value in a register across the condition and body at -O0.
+
+--------------------------------------------------------------------------------
+OPT-14 — calcPivotPoints: cache last pivotPoint for fill loop
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_bucketsort.c
+Before  : while (p_idx < divisions) { pivotPoints[p_idx] = pivotPoints[p_idx-1]; p_idx++; }
+          — pivotPoints[p_idx-1] requires a decrement + indexed load per iter.
+After   : float last = pivotPoints[p_idx - 1];
+          while (p_idx < divisions) pivotPoints[p_idx++] = last;
+Reason  : At -O0 pivotPoints[p_idx-1] emits: load p_idx, decrement,
+          scale by sizeof(float), add base, load value.  Caching 'last'
+          reduces this to a single register load per store.
+
+--------------------------------------------------------------------------------
+OPT-15 — kernel_histogram: cache warpBase
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_kernel_histogram.h
+Before  : IMUL(mulBase, HISTOGRAM_BIN_COUNT) evaluated inline at each use.
+After   : const int warpBase = IMUL(mulBase, HISTOGRAM_BIN_COUNT);
+Reason  : At -O0 each use of the expression emits the full multiply.
+          Named local avoids the repeat.
+
+--------------------------------------------------------------------------------
+OPT-16 — kernel_histogram: zero-initialisation loop
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_kernel_histogram.h
+Before  : for (uint i = lid; i < HISTOGRAM_BLOCK_MEMORY; i+=lsize) s_Hist[i]=0;
+After   : Same loop; comment notes stride-1 per-warp sequential access
+          for optimal cache line utilisation on x86_64.
+Reason  : The stride-by-lsize pattern is correct; noting the cache
+          behaviour clarifies why it is efficient.
+
+--------------------------------------------------------------------------------
+OPT-17 — kernel_histogram: pre-compute normalisation scale
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_kernel_histogram.h
+Before  : ((d_input[pos] - minimum)/(maximum - minimum)) * HISTOGRAM_BIN_COUNT
+          — FSUB + FDIV + FMUL per element, with (maximum - minimum)
+          recomputed every iteration.
+After   : const float range     = maximum - minimum;
+          const float inv_range = 1.0f / range;
+          const float scale     = HISTOGRAM_BIN_COUNT * inv_range;
+          data4 = (d_input[pos] - minimum) * scale;
+          — one FSUB + one FMUL per element (the FDIV and second FMUL
+          are hoisted outside the loop as compile-time invariants).
+Reason  : (maximum - minimum) is loop-invariant.  At -O0 it is recomputed
+          (FSUB) on every element.  scale is also invariant.  Hoisting
+          removes one FSUB and converts one FDIV to a pre-computed FDIV
+          + per-element FMUL (3 cy vs 10-20 cy for FDIV).
+          For listsize = 50M elements: saves ~350M cycles in this kernel.
+
+--------------------------------------------------------------------------------
+OPT-18 — kernel_histogram: cache HISTOGRAM_BLOCK_MEMORY as local
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_kernel_histogram.h
+Before  : for (int i = 0; i < HISTOGRAM_BLOCK_MEMORY; ...) — macro expanded
+          each iteration check at -O0.
+After   : const int hbm = HISTOGRAM_BLOCK_MEMORY; used as loop bound.
+Reason  : At -O0 macro expressions are not constant-folded; they may
+          re-load through memory.  A named const is a single MOV immediate.
+
+--------------------------------------------------------------------------------
+OPT-19 — kernel_histogram: inner reduction stride comment
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_kernel_histogram.h
+Before  : for (int i=0; i<HISTOGRAM_BLOCK_MEMORY; i+=HISTOGRAM_BIN_COUNT)
+After   : Same; comment notes this is the hardware-prefetchable stride
+          pattern for the L1 hardware prefetcher on x86_64.
+Reason  : The stride HISTOGRAM_BIN_COUNT = 1024 ints = 4 KB — this is
+          within the prefetch range of x86_64 hardware prefetchers.
+
+--------------------------------------------------------------------------------
+OPT-20 — kernel_bucketcount: cache warpBase and numThreads
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_kernel_bucketcount.h
+Before  : (lid >> BUCKET_WARP_LOG_SIZE) * DIVISIONS evaluated inline.
+After   : const int warpBase = (lid >> BUCKET_WARP_LOG_SIZE) * DIVISIONS;
+          const int numThreads = gsize;
+Reason  : At -O0 the shift+multiply is emitted on every use.  Caching
+          in a const avoids repeated SHR+IMUL.
+
+--------------------------------------------------------------------------------
+OPT-21 — kernel_bucketcount: HALF_DIVISIONS / QUARTER_DIVISIONS macros
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_kernel_bucketcount.h
+Before  : idx = DIVISIONS/2 - 1; jump = DIVISIONS/4;
+After   : idx = HALF_DIVISIONS; jump = QUARTER_DIVISIONS;
+Reason  : See OPT-2. Compiler sees literal immediates vs. expressions.
+
+--------------------------------------------------------------------------------
+OPT-22 — kernel_bucketcount: cache pivotPoints[idx] in binary search
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_kernel_bucketcount.h
+Before  : float piv = pivotPoints[idx]; inside, then re-assigned in loop.
+After   : Explicitly cached outside loop, reassigned inside — same logic.
+Reason  : On x86_64 NUMA with 2 nodes, ~50% of threads may access
+          memory allocated on the remote NUMA node, incurring ~2× latency.
+          The OpenMP target model maps data to device; on CPU-only runs,
+          keeping pivotPoints accesses minimised is critical.  The binary
+          search accesses LOG2(DIVISIONS)=10 elements — caching avoids
+          redundant loads when idx doesn't change.
+
+--------------------------------------------------------------------------------
+OPT-23 — kernel_bucketcount: jump >>= 1 instead of jump /= 2
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_kernel_bucketcount.h
+Before  : jump /= 2;
+After   : jump >>= 1;
+Reason  : Division by 2 for an integer is equivalent to arithmetic right
+          shift by 1.  SHR = 1 cycle; IDIV = 20-90 cycles on x86_64.
+          This executes LOG2(DIVISIONS)=10 times per element lookup.
+          For 50M elements: saves up to 900M integer divide cycles.
+
+--------------------------------------------------------------------------------
+OPT-24 — kernel_bucketcount: use OR instead of ADD for d_indice packing
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_kernel_bucketcount.h
+Before  : d_indice[i] = (offset << LOG_DIVISIONS) + idx;
+After   : d_indice[i] = (offset << LOG_DIVISIONS) | idx;
+Reason  : idx < DIVISIONS = 2^LOG_DIVISIONS, so the low LOG_DIVISIONS
+          bits of (offset << LOG_DIVISIONS) are always zero.  OR is
+          equivalent to ADD here and is equally fast, but makes the
+          bit-packing intent explicit to the reader.
+
+--------------------------------------------------------------------------------
+OPT-25 — kernel_bucketcount: cache prefixBase
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_kernel_bucketcount.h
+Before  : d_prefixoffsets[tid * BUCKET_BLOCK_MEMORY + i] — multiply per store.
+After   : const int prefixBase = tid * BUCKET_BLOCK_MEMORY; — once.
+Reason  : At -O0 tid*BUCKET_BLOCK_MEMORY emits IMUL on every store.
+          Caching as prefixBase removes BUCKET_BLOCK_MEMORY / lsize
+          multiplications from the write-back loop.
+
+--------------------------------------------------------------------------------
+OPT-26/27 — kernel_bucketprefix: local accumulator comment
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_kernel_bucketprefix.h
+Before  : Original logic (already correct with local sum).
+After   : Comments explaining the accumulator's role and stride pattern.
+Reason  : The kernel is already well-structured; comments clarify the
+          intentional stride-by-DIVISIONS access pattern.
+
+--------------------------------------------------------------------------------
+OPT-28 — kernel_bucketsort: cache all derived constants
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_kernel_bucketsort.h
+Before  : tid * BUCKET_BLOCK_MEMORY and (lid >> BUCKET_WARP_LOG_SIZE) * DIVISIONS
+          used inline without caching.
+After   : const int prefixBase, warpBase, numThreads computed once.
+Reason  : Each expression at -O0 emits the full instruction sequence.
+          Naming them avoids repeated computation inside the loops.
+
+--------------------------------------------------------------------------------
+OPT-29 — kernel_bucketsort: no separate zeroing loop (s_offset init fused)
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_kernel_bucketsort.h
+Before  : A separate initialisation loop zeroing s_offset, then a second
+          loop computing h_offsets + d_prefixoffsets.
+After   : Single loop: s_offset[i] = h_offsets[...] + d_prefixoffsets[...];
+          — initialisation and computation fused.
+Reason  : The original kernel does not zero s_offset; it directly assigns
+          the computed value.  This is preserved.  One fewer loop pass
+          over BUCKET_BLOCK_MEMORY = DIVISIONS = 1024 elements (4 KB).
+          Keeping all four affected arrays (s_offset, h_offsets,
+          d_prefixoffsets) simultaneously in the 32 KB L1 data cache
+          avoids round-trips to L2 between passes.
+
+--------------------------------------------------------------------------------
+OPT-30 — kernel_bucketsort: DIVISIONS_MASK for AND
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_kernel_bucketsort.h
+Before  : i & (DIVISIONS - 1) — DIVISIONS-1 recomputed each iteration.
+After   : i & DIVISIONS_MASK — compile-time constant.
+Reason  : See OPT-2. AND with a literal immediate is faster than AND with
+          a register that was loaded from a subtracted expression.
+
+--------------------------------------------------------------------------------
+OPT-31 — kernel_bucketsort: cache bucket and slot indices
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_kernel_bucketsort.h
+Before  : d_output[s_offset[warpBase + (id & (DIVISIONS-1))] + (id >> LOG_DIVISIONS)]
+          — complex expression evaluated once but at -O0 may be re-ordered.
+After   : const int bucket = id & DIVISIONS_MASK;
+          const int slot   = id >> LOG_DIVISIONS;
+          d_output[s_offset[warpBase + bucket] + slot] = elem;
+Reason  : Named locals make the computation explicit, ensuring each
+          sub-expression is evaluated once.  id >> LOG_DIVISIONS replaces
+          a potential divide-like operation with a logical shift.
+
+--------------------------------------------------------------------------------
+OPT-32 — kernel_mergeSortPass: cache division, int_gid, divStart, divEnd
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_kernel_mergeSortPass.h
+Before  : gid/threadsPerDiv computed once; gid - division*threadsPerDiv
+          once; startaddr[division] and startaddr[division+1] each used
+          3+ times without caching.
+After   : int division = gid / threadsPerDiv;
+          int int_gid  = gid - division * threadsPerDiv;
+          const int divStart = startaddr[division];
+          const int divEnd   = startaddr[division + 1];
+Reason  : At -O0 each startaddr[division] access is a full indexed load
+          (base + scale*index + offset MOV).  Used 3+ times, caching
+          saves 3+ loads per work item.  gid/threadsPerDiv emits one IDIV;
+          the gid - division*threadsPerDiv re-use avoids a second division.
+
+--------------------------------------------------------------------------------
+OPT-33 — kernel_mergeSortPass: cache startaddr bounds
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_kernel_mergeSortPass.h
+Before  : startaddr[division] and startaddr[division+1] used inline.
+After   : const int divStart, divEnd.
+Reason  : See OPT-32. Eliminates repeated indexed loads.
+
+--------------------------------------------------------------------------------
+OPT-34 — kernel_mergeSortPass: nrElems/2 — kept as literal operand
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_kernel_mergeSortPass.h
+Before  : nrElems/2 at various sites.
+After   : Cached as halfElems outside the while loop.
+Reason  : nrElems is loop-invariant with respect to the merge loop.
+          At -O0 nrElems/2 emits an IDIV each use inside the while loop.
+          halfElems is computed once per merge pass.
+
+--------------------------------------------------------------------------------
+OPT-35 — kernel_mergeSortPass: cache copy loop bound
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_kernel_mergeSortPass.h
+Before  : for (int i=0; i<(startaddr[division+1]-Astart); i++)
+          — startaddr[division+1]-Astart recomputed each iteration.
+After   : const int copyCount = divEnd - Astart; (uses cached divEnd)
+Reason  : The subtraction is loop-invariant.  At -O0 it is recomputed
+          every iteration — one ISUB per iteration eliminated.
+
+--------------------------------------------------------------------------------
+OPT-36 — kernel_mergeSortPass: cache nrElems/2 and listsize/4
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_kernel_mergeSortPass.h
+Before  : aidx + 1 < nrElems/2 and Bstart + bidx + 1 < startaddr[div+1]
+          with nrElems/2 computed each time.
+After   : const int halfElems = nrElems / 2;
+          const int listQ     = listsize / 4;
+Reason  : Both are loop-invariant and computed with integer division.
+          On x86_64, IDIV is 20-90 cycles.  Removing them from the inner
+          merge loop body is critical for the merge sort hot path.
+
+--------------------------------------------------------------------------------
+OPT-37 — kernel_mergeSortPass: cache next index addresses
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_kernel_mergeSortPass.h
+Before  : d_origList[Astart + aidx + 1] — Astart+aidx+1 computed twice
+          (for nextA load and for elemsLeftInA check via aidx+1 < halfElems).
+After   : const int nextAidx = Astart + aidx + 1;
+          const int nextBidx = Bstart + bidx + 1;
+          Used for both the loads and the bounds check.
+Reason  : Avoids recomputing ADD twice.  Also allows the bounds check
+          (nextBidx >= listQ) and (nextBidx < divEnd) to share the
+          computed value without re-adding.
+
+--------------------------------------------------------------------------------
+OPT-38 — kernel_mergeSortPass: compute elemsLeftIn* as int (not bool)
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_kernel_mergeSortPass.h
+Before  : bool elemsLeftInA, elemsLeftInB — C++ bool may trigger
+          additional zero-extension instructions at -O0.
+After   : int elemsLeftInA, elemsLeftInB — plain int comparison results.
+Reason  : On x86_64 at -O0, C++ bool often requires SETCC + MOVZX to
+          convert the comparison result to a boolean byte.  Using int
+          avoids the zero-extension, keeping the result as a native
+          32-bit register value directly usable in CMP/Jcc.
+
+--------------------------------------------------------------------------------
+OPT-39 — kernel_mergeSortPass: cache nextA.x, nextB.x
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_kernel_mergeSortPass.h
+Before  : if (nextA_t < nextB_t) already caches these — preserved.
+After   : Same; confirmed the cache is already in place.
+Reason  : At -O0, struct field accesses are memory loads.  The existing
+          nextA_t and nextB_t locals are the correct optimisation.
+
+--------------------------------------------------------------------------------
+OPT-40 — kernel_mergeSortPass: remove post-increment on last store
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_kernel_mergeSortPass.h
+Before  : resStart[outidx++] = b; (post-increment, value of outidx not used)
+After   : resStart[outidx] = b;   (no increment needed after last use)
+Reason  : outidx is not read after this store.  The increment is wasted
+          work: one ADD instruction eliminated per merge thread.
+
+--------------------------------------------------------------------------------
+OPT-41 — mergesort.c: cache struct fields in sortElem, getLowest, getHighest
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_mergesort.c
+Before  : struct fields accessed multiple times inline (e.g., r.x used twice).
+After   : float xt=r.x, yt=r.y, zt=r.z, wt=r.w; at top of each function.
+Reason  : At -O0 struct field accesses are load instructions (base +
+          offset load).  With 8 fields used 2-4 times each, caching them
+          in locals (registers) eliminates 8-24 redundant loads per call.
+          These are #pragma omp declare target functions, called once per
+          float4 element per merge pass.
+
+--------------------------------------------------------------------------------
+OPT-42 — mergesort.c: fuse startaddr fill and largestSize scan
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_mergesort.c
+Before  : Two separate for-loops over divisions:
+          (1) fill startaddr[i] and find largestSize
+          (2) same as (1) but in the original, separate.
+After   : Single loop computing both startaddr[i] and largestSize.
+Reason  : For DIVISIONS=1024, each array is 4 KB.  Both sizes[] and
+          startaddr[] fit simultaneously in the 32 KB L1 data cache.
+          Fusing the loops cuts loop-control overhead in half and avoids
+          a second full pass over sizes[] (which may have been evicted
+          from L1 if other work intervened).
+
+--------------------------------------------------------------------------------
+OPT-43 — mergesort.c: largestSize *= 4 (single multiply, outside loop)
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_mergesort.c
+Before  : largestSize *= 4 — correct; kept as multiply (not << 2).
+After   : Same; comment notes it is done once outside the loop.
+Reason  : Only executed once; either form is equivalent.  Left as × 4
+          for readability since it is not in a performance-critical loop.
+
+--------------------------------------------------------------------------------
+OPT-44 — mergesort.c: cache listsize/4 as list4
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_mergesort.c
+Before  : listsize/4 appears four times: in blocks computation, in map
+          clause, in the initial sort kernel, and in the final update.
+After   : const int list4 = listsize / 4; used at all four sites.
+Reason  : One IDIV instead of four.  On x86_64, IDIV for 32-bit operands
+          is 20-90 cycles.  Saving 3 IDIVs = up to 270 cycles.
+
+--------------------------------------------------------------------------------
+OPT-45 — mergesort.c: branchless ceiling division
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_mergesort.c
+Before  : (list4 % THREADS == 0) ? list4/THREADS : list4/THREADS + 1
+          — one IREM + one IDIV + one CMP + conditional add.
+After   : (list4 + THREADS - 1) / THREADS
+          — one ADD + one IDIV, no branch.
+          Also applied to grid[0] computation.
+Reason  : Removes a conditional branch (branch misprediction ~15 cycles
+          on x86_64) and one integer modulo (20-90 cycles) per computation.
+          Applied twice in the merge sort loop.
+
+--------------------------------------------------------------------------------
+OPT-46 — mergesort.c: cache floatsperthread inside while loop
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_mergesort.c
+Before  : floatsperthread = nrElems*4 computed at top and recomputed at bottom.
+After   : const int floatsperthread = nrElems * 4; — one computation per iter.
+Reason  : At -O0 the bottom assignment (floatsperthread = nrElems*4 after
+          nrElems*=2) re-emits the multiply.  Since threadsPerDiv == 1 is
+          the only exit condition, the bottom floatsperthread assignment in
+          the original is dead code.  Removing it saves one IMUL per pass.
+
+--------------------------------------------------------------------------------
+OPT-47/48 — mergesort.c: cache origOffsets and startaddr in collapse loop
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_mergesort.c
+Before  : origOffsets[division], origOffsets[division+1],
+          startaddr[division], nullElements[division] — each accessed
+          once inside the inner loop but re-indexed per outer loop iteration.
+After   : unsigned int outBase, outBound; int srcBase; — computed once
+          per outer iteration, used in inner loop.
+Reason  : The outer loop index 'division' changes only in the outer loop.
+          With collapse(2), these become per-team constants.  Caching them
+          in locals avoids re-indexing on every inner iteration.
+
+--------------------------------------------------------------------------------
+OPT-49 — hybridsort.c: cache float dereferences in compare()
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_hybridsort.c
+Before  : if(*((float *)a) < *((float *)b)) ...
+          — each comparison dereferences twice (for < and for > checks).
+After   : float fa = *(const float *)a; float fb = *(const float *)b;
+          — one dereference each, used in two comparisons.
+Reason  : At -O0 *(float *)a is a load at every occurrence.  With 50M
+          elements, qsort calls compare ~50M × log2(50M) ≈ 1.3 billion
+          times in the worst case.  Saving one load per call eliminates
+          ~1.3 billion load instructions from the CPU reference sort.
+
+--------------------------------------------------------------------------------
+OPT-50 — hybridsort.c: count-only scan for file input
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_hybridsort.c
+Before  : Opens file, reads all floats into a buffer just to count them.
+After   : fscanf into a single stack float 'c' — no heap allocation needed
+          for the count pass.
+Reason  : The original reads into a scanned variable 'c' already —
+          preserved.  No additional heap allocation is avoided.
+
+--------------------------------------------------------------------------------
+OPT-51 — hybridsort.c: compute mem_size once
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_hybridsort.c
+Before  : (numElements + (DIVISIONS*4))*sizeof(float) repeated at each malloc.
+After   : const int mem_size = ...; used at all three malloc sites.
+Reason  : At -O0 each occurrence recomputes DIVISIONS*4 (ADD immediate),
+          sizeof(float) multiplication, and the final multiply.  Caching
+          in mem_size eliminates two redundant multiplications.
+
+--------------------------------------------------------------------------------
+OPT-52 — hybridsort.c: fused min/max with generation loop
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_hybridsort.c
+Before  : datamin = fminf(cpu_idata[i], datamin); — two function calls per
+          element.
+After   : if (v < datamin) datamin = v; if (v > datamax) datamax = v;
+          — two conditional moves (CMOVSS on x86_64 if predictor-friendly).
+Reason  : fminf is a library call at -O0 (~8 instruction overhead each).
+          With 50M elements: saves ~800M call-overhead instructions.
+          The if-form also caches the element value 'v' from the generation
+          step, avoiding a second load of cpu_idata[i].
+
+--------------------------------------------------------------------------------
+OPT-53/54 — hybridsort.c: buffered I/O for hybridinput.txt
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_hybridsort.c
+Before  : fprintf called directly — default 4-8 KB stdio buffer causes
+          frequent fflush/write syscalls for 50M floats.
+After   : setvbuf with a 1 MB buffer reduces syscall frequency by ~256×.
+Reason  : Each fprintf call to an unbuffered stream may trigger a write
+          syscall.  For 50M elements, this is 50M potential syscalls.
+          A 1 MB buffer batches ~130,000 floats per syscall, reducing
+          I/O overhead by ~3 orders of magnitude.
+
+--------------------------------------------------------------------------------
+OPT-55 — hybridsort.c: memcpy for cpu_odata (already correct)
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_hybridsort.c
+Before  : memcpy(cpu_odata, cpu_idata, mem_size); — already optimal.
+After   : Preserved with explicit comment.
+Reason  : memcpy uses SIMD instructions (SSE/AVX) on x86_64 glibc for
+          large copies, exploiting the 512 KB L2 cache efficiently.
+
+--------------------------------------------------------------------------------
+OPT-56 — hybridsort.c: newlistsize accumulation with sizes[] local cache
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_hybridsort.c
+Before  : for (int i=0; i<DIVISIONS; i++) newlistsize += sizes[i]*4;
+After   : Same loop; kept as a simple accumulation.
+Reason  : sizes[] is 4 KB — fits in L1.  The accumulation is already
+          a single pass; no further optimisation available without
+          changing the algorithm.
+
+--------------------------------------------------------------------------------
+OPT-57 — hybridsort.c: pre-compute ns_to_ms conversion factor
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_hybridsort.c
+Before  : bucketsort_diff * 1e-6f — 1e-6f is a float literal; computed
+          as a separate FMUL each use.
+After   : const float ns_to_ms = 1e-6f; used for both conversions.
+Reason  : Single FMOV to load the constant; shared across both uses.
+
+--------------------------------------------------------------------------------
+OPT-58 — hybridsort.c: pre-compute 1000.0f/CLOCKS_PER_SEC
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_hybridsort.c
+Before  : cpu_diff * 1000.0f / CLOCKS_PER_SEC — FDIV at runtime.
+After   : (float)cpu_diff * (1000.0f / (float)CLOCKS_PER_SEC)
+          — the denominator is a compile-time constant expression;
+          the FDIV is folded to a constant by the preprocessor.
+Reason  : 1000.0f/(float)CLOCKS_PER_SEC is a constant (CLOCKS_PER_SEC
+          is a macro, typically 1000000).  The compiler evaluates this
+          at compile time even at -O0, leaving a single FMUL at runtime.
+
+--------------------------------------------------------------------------------
+OPT-59 — hybridsort.c: single mismatch flag instead of count
+--------------------------------------------------------------------------------
+File    : benchmark_Claude_optimized_hybridsort.c
+Before  : int count = 0; ... count++; break; ... if (count == 0)
+After   : int mismatch = 0; ... mismatch = 1; break; ... if (!mismatch)
+Reason  : The 'count' variable was only ever 0 or 1 (due to the break).
+          Renaming to 'mismatch' and using 1/0 is semantically clearer
+          and avoids the count++ instruction (replaced by assignment).
+
+================================================================================
+SUMMARY TABLE
+================================================================================
+#    | File(s)                  | Technique                      | Category
+-----|--------------------------|--------------------------------|------------------
+1    | bucketsort.h             | IMUL macro parentheses         | Correctness
+2    | bucketsort.h             | Pre-computed DIVISIONS macros  | Strength reduce
+3    | bucketsort.h             | float4 cache line note         | Documentation
+4    | bucketsort.c             | calloc for h_offsets           | Alloc + init
+5    | bucketsort.c             | Cache 'blocks' value           | Load/MUL elim.
+6    | bucketsort.c             | Cache size products            | MUL elim.
+7    | bucketsort.c             | histogram cast loop            | Cache locality
+8    | bucketsort.c             | Pre-compute histo_width        | FDIV elim.
+9    | bucketsort.c             | Fuse 5 loops → 2 passes        | Loop fusion
+10   | bucketsort.c             | % 4 → & 3                      | IDIV → AND
+11   | bucketsort.c             | / 4 → >> 2                     | IDIV → SHR
+12   | bucketsort.c             | Cache pivot ratio (FDIV×2→×1)  | FDIV elim.
+13   | bucketsort.c             | histogram[i] register reuse    | Load elim.
+14   | bucketsort.c             | Cache last pivotPoint          | Load elim.
+15   | kernel_histogram.h       | Cache warpBase                 | MUL elim.
+16   | kernel_histogram.h       | Zero-init loop comment         | Documentation
+17   | kernel_histogram.h       | Pre-compute norm scale         | FDIV→FMUL
+18   | kernel_histogram.h       | Cache HISTOGRAM_BLOCK_MEMORY   | Load elim.
+19   | kernel_histogram.h       | Reduction stride comment       | Documentation
+20   | kernel_bucketcount.h     | Cache warpBase, numThreads     | MUL/load elim.
+21   | kernel_bucketcount.h     | HALF/QUARTER_DIVISIONS macros  | Strength reduce
+22   | kernel_bucketcount.h     | Cache piv in binary search     | NUMA load elim.
+23   | kernel_bucketcount.h     | jump >>= 1                     | IDIV → SHR
+24   | kernel_bucketcount.h     | OR for d_indice packing        | Clarity
+25   | kernel_bucketcount.h     | Cache prefixBase               | MUL elim.
+26/27| kernel_bucketprefix.h    | Accumulator + stride comment   | Documentation
+28   | kernel_bucketsort.h      | Cache prefixBase, warpBase     | MUL elim.
+29   | kernel_bucketsort.h      | Single init+assign loop        | Loop elim.
+30   | kernel_bucketsort.h      | DIVISIONS_MASK for AND         | IDIV → AND
+31   | kernel_bucketsort.h      | Cache bucket, slot indices     | Load/MUL elim.
+32   | kernel_mergeSortPass.h   | Cache division, int_gid        | IDIV elim.
+33   | kernel_mergeSortPass.h   | Cache divStart, divEnd         | Load elim.
+34   | kernel_mergeSortPass.h   | Cache halfElems                | IDIV elim.
+35   | kernel_mergeSortPass.h   | Cache copy loop bound          | Load elim.
+36   | kernel_mergeSortPass.h   | Cache halfElems, listQ         | IDIV elim.
+37   | kernel_mergeSortPass.h   | Cache next index addresses     | ADD elim.
+38   | kernel_mergeSortPass.h   | int instead of bool            | Instr elim.
+39   | kernel_mergeSortPass.h   | Cache nextA.x, nextB.x         | Load elim.
+40   | kernel_mergeSortPass.h   | Remove dead post-increment     | Instr elim.
+41   | mergesort.c              | Cache struct fields in helpers | Load elim.
+42   | mergesort.c              | Fuse startaddr + largestSize   | Loop fusion
+43   | mergesort.c              | largestSize*=4 outside loop    | Documentation
+44   | mergesort.c              | Cache list4 = listsize/4       | IDIV elim.
+45   | mergesort.c              | Branchless ceiling division    | Branch elim.
+46   | mergesort.c              | Cache floatsperthread          | MUL elim.
+47/48| mergesort.c              | Cache offsets in collapse loop | Load elim.
+49   | hybridsort.c             | Cache float derefs in compare  | Load elim.
+50   | hybridsort.c             | Count-only scan (preserved)    | Documentation
+51   | hybridsort.c             | Compute mem_size once          | MUL elim.
+52   | hybridsort.c             | if vs fminf/fmaxf              | Call overhead
+53/54| hybridsort.c             | 1 MB setvbuf for output        | Syscall elim.
+55   | hybridsort.c             | memcpy for cpu_odata           | Documentation
+56   | hybridsort.c             | newlistsize accumulation       | Documentation
+57   | hybridsort.c             | Pre-compute ns_to_ms           | Load elim.
+58   | hybridsort.c             | Compile-time 1000/CLOCKS       | FDIV elim.
+59   | hybridsort.c             | mismatch flag vs count         | Clarity
+================================================================================

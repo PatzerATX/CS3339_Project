@@ -1,0 +1,212 @@
+================================================================================
+rsbench_ClaudeSonnet_optimized — Optimization Report
+Target: x86_64, compiled at -O0
+================================================================================
+
+At -O0 the compiler performs no automatic optimization: every expression is
+fully evaluated, no CSE, LICM, strength reduction, or register allocation
+beyond the bare minimum.  All savings must be expressed in source.
+
+The program's critical hot path is:
+  run_event_based_simulation
+    └─ calculate_macro_xs              (per nuclide in material)
+         ├─ calculate_micro_xs_doppler  (per nuclide, inner pole loop)
+         │    ├─ calculate_sig_T        (4 sqrt + trig calls per nuclide)
+         │    └─ fast_nuclear_W         (Faddeeva, per pole in window)
+         └─ calculate_micro_xs          (same structure, non-Doppler)
+              └─ calculate_sig_T
+
+All optimizations are in simulation.c.  The remaining files
+(main.c, rsbench.h, init.c, io.c, material.c, utils.c) are unchanged.
+
+--------------------------------------------------------------------------------
+FILE: simulation.c
+--------------------------------------------------------------------------------
+
+1. FAST_NUCLEAR_W — HOIST fast_cexp(c_mul(t1,Z)) OUTSIDE THE 10-ITERATION LOOP
+   [HIGHEST IMPACT]
+
+   Original: inside the loop (n = 0..9):
+       RSComplex top = c_sub(c_mul(t3, fast_cexp(c_mul(t1, Z))), one);
+
+   Optimized (hoisted before loop):
+       RSComplex t1Z     = c_mul(t1, Z);
+       RSComplex exp_t1Z = fast_cexp(t1Z);   // computed once
+       // in loop:
+       RSComplex top = c_sub(c_mul(t3, exp_t1Z), one);
+
+   Reason: t1 = {0,12} is a constant and Z is the function parameter — both are
+   invariant for all 10 loop iterations.  At -O0, c_mul(t1,Z) and fast_cexp(...)
+   are fully re-evaluated each iteration.  fast_cexp() calls fast_exp() (12
+   squarings), cos(), and sin() — three expensive transcendental operations.
+   The same expression is also used to compute W before the loop
+   (c_sub(one, fast_cexp(c_mul(t1,Z)))), which shares the same precomputed value.
+   Hoisting reduces 11 fast_cexp calls (10 in loop + 1 for W) to a single call,
+   eliminating 10 * (fast_exp + cos + sin) per Faddeeva evaluation.
+
+2. FAST_NUCLEAR_W — HOIST c_mul(t5, c_mul(Z,Z)) OUTSIDE THE LOOP
+
+   Original: inside loop:
+       RSComplex bot = c_sub(t4, c_mul(t5, c_mul(Z,Z)));
+
+   Optimized (hoisted before loop):
+       RSComplex Z2    = c_mul(Z, Z);    // Z^2 once
+       RSComplex t5_Z2 = c_mul(t5, Z2); // 144*Z^2 once
+       // in loop:
+       RSComplex bot = c_sub(t4, t5_Z2);
+
+   Reason: t5 = {144,0} and Z are both loop-invariant.  c_mul(Z,Z) and
+   c_mul(t5, ...) are each 4 multiplies and 2 adds; the original recomputes
+   them 10 times.  Hoisting saves 9 * (2 complex multiplies) = 36 double
+   multiplies per Faddeeva call.
+
+3. FAST_NUCLEAR_W — MAKE CONSTANT TABLES static const
+
+   Original: an[10], neg_1n[10], denominator_left[10] are plain local arrays,
+   initialized on the stack each call.
+
+   Optimized: declared static const.
+
+   Reason: At -O0, each call to fast_nuclear_W re-initializes 30 doubles
+   (10+10+10) via stack stores.  static const places them in the read-only data
+   segment, initialized once at program start.  This saves 30 double stores per
+   call.  fast_nuclear_W is called once per pole in the inner loop, making this
+   saving multiply over the entire simulation.
+
+4. c_div — RECIPROCAL MULTIPLY REPLACES TWO DIVISIONS
+
+   Original:
+       double denom = c*c + d*d;
+       C.r = ((a*c) + (b*d)) / denom;
+       C.i = ((b*c) - (a*d)) / denom;
+
+   Optimized:
+       double inv_denom = 1.0 / (c*c + d*d);
+       C.r = ((a*c) + (b*d)) * inv_denom;
+       C.i = ((b*c) - (a*d)) * inv_denom;
+
+   Reason: x86 double-precision division latency is ~14-20 cycles; multiply is
+   ~4 cycles.  The original performs 2 divisions per c_div call.  The optimized
+   version performs 1 division (for the reciprocal) and 2 multiplies, saving 1
+   division per call.  c_div is called in every pole iteration (twice in
+   calculate_micro_xs, once in fast_nuclear_W's main W computation, and up to
+   10 times inside fast_nuclear_W's Abrarov loop), so this saving compounds
+   over millions of calls.
+
+5. calculate_sig_T — CACHE sqrt(E) AND nuc*input.numL
+
+   Original: inside the loop (i = 0..3):
+       phi = pseudo_K0RS[nuc * input.numL + i] * sqrt(E);
+
+   Optimized (hoisted before loop):
+       double sqrtE  = sqrt(E);
+       int k0rs_base = nuc * input.numL;
+       // in loop:
+       phi = pseudo_K0RS[k0rs_base + i] * sqrtE;
+
+   Reason: sqrt(E) is loop-invariant; the original calls it 4 times per
+   calculate_sig_T invocation.  Hoisting saves 3 sqrt() calls.  nuc*input.numL
+   is also loop-invariant; caching saves 3 integer multiplies.
+   calculate_sig_T is called for every nuclide in every material in every
+   lookup, so the saving scales with lookups * avg_nuclides_per_mat.
+
+6. calculate_micro_xs — HOIST sqrt(E), t1, E_c OUTSIDE POLE LOOP
+
+   Original: inside the pole loop:
+       RSComplex t2 = {sqrt(E), 0};   // sqrt called every iteration
+       RSComplex t1 = {0, 1};         // struct re-initialized every iteration
+       RSComplex E_c = {E, 0};        // struct re-initialized every iteration
+
+   Optimized (hoisted before loop):
+       double    sqrtE = sqrt(E);
+       RSComplex t1    = {0, 1};
+       RSComplex E_c   = {E, 0};
+       // in loop:
+       RSComplex t2 = {sqrtE, 0};
+
+   Reason: All three are loop-invariant.  At -O0 each RSComplex struct literal
+   is two double stores; each sqrt() is a function call.  Hoisting saves
+   (n_poles_per_window - 1) * (1 sqrt + 4 double stores) per nuclide lookup.
+
+7. calculate_micro_xs — CACHE nuc*max_num_poles AS pole_base
+
+   Original: inside pole loop:
+       Pole pole = poles[nuc * max_num_poles + i];
+
+   Optimized (hoisted before loop):
+       int pole_base = nuc * max_num_poles;
+       // in loop:
+       Pole pole = poles[pole_base + i];
+
+   Reason: nuc and max_num_poles are both loop-invariant.  At -O0 the multiply
+   is re-executed every iteration.  Caching saves n_poles_per_window integer
+   multiplies per nuclide lookup.
+
+8. calculate_micro_xs_doppler — HOIST E_c, dopp_c OUTSIDE POLE LOOP;
+   CACHE pole_base
+
+   Same class of optimizations as items 6 and 7 applied to the Doppler variant:
+   E_c = {E,0} and dopp_c = {0.5,0} are loop-invariant constant structs moved
+   outside the pole loop, and nuc*max_num_poles is cached as pole_base.
+
+9. calculate_macro_xs — CACHE mat*max_num_nucs AND concs[mat_base+i]
+
+   Original (per nuclide i):
+       int nuc  = mats[mat * max_num_nucs + i];     // mat*max_num_nucs twice
+       // ...
+       macro_xs[j] += micro_xs[j] * concs[mat * max_num_nucs + i];  // again
+
+   Optimized:
+       int mat_base = mat * max_num_nucs;            // computed once
+       int nuc      = mats[mat_base + i];
+       double conc  = concs[mat_base + i];           // loaded once
+       for( int j = 0; j < 4; j++ )
+           macro_xs[j] += micro_xs[j] * conc;
+
+   Reason: mat*max_num_nucs is computed twice per nuclide in the original.
+   concs[mat_base+i] is read once per j iteration (4 times) at -O0, since the
+   array access is not factored.  Caching in conc reduces it to 1 load.
+
+10. pick_mat — REPLACE O(n^2) NESTED LOOP WITH O(n) PREFIX ACCUMULATION
+
+    Original: outer loop i=0..11, inner loop j=i..1: O(72) operations total.
+    The inner loop recomputes sum(dist[1..i]) from scratch for each i.
+
+    Optimized: single loop i=1..11 accumulating running sum: O(11) operations.
+
+    Reason: The running sum sum(dist[1..i]) at step i equals sum(dist[1..i-1])
+    plus dist[i] — incrementally computable.  At -O0 with no CSE, the original's
+    inner loop executes 0+1+2+...+11 = 66 double additions total vs. 11 in the
+    optimized version.  Verified to produce identical return values for all
+    inputs by tracing the partial sums.
+
+    Also: dist[] declared static const — array lives in read-only data rather
+    than being stack-initialized on every call.
+
+--------------------------------------------------------------------------------
+FILE: Makefile
+--------------------------------------------------------------------------------
+
+11. EXPLICIT -O0 AND DEVICE=cpu
+    Set OPTIMIZE=no, added -O0 explicitly to CFLAGS, set DEVICE=cpu to select
+    the -qopenmp CPU path instead of GPU offload.
+
+--------------------------------------------------------------------------------
+UNCHANGED FILES
+--------------------------------------------------------------------------------
+  main.c      — program entry, no hot-path code
+  rsbench.h   — type definitions and declarations only
+  init.c      — initialization only, not on critical path
+  io.c        — I/O only, not on critical path
+  material.c  — material setup only, not on critical path
+  utils.c     — timing and memory utilities only
+
+================================================================================
+Summary of optimization categories applied:
+  - Loop-invariant code motion (LICM): items 1, 2, 5, 6, 7, 8, 9
+  - Arithmetic strength reduction (div→mul): items 4
+  - Redundant computation elimination: items 1, 2, 5, 10
+  - Static constant placement (stack → rodata): items 3, 10
+  - Algorithmic improvement (O(n^2) → O(n)): item 10
+  - Redundant load elimination: item 9
+================================================================================

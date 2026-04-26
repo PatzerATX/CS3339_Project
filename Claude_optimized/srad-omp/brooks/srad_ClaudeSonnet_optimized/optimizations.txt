@@ -1,0 +1,189 @@
+================================================================================
+srad_ClaudeSonnet_optimized — Optimization Report
+Target: x86_64, compiled at -O0
+================================================================================
+
+At -O0, every C expression maps directly to load/store/arithmetic instructions;
+the compiler performs no CSE, LICM, register allocation, or dead-code elimination.
+All optimizations must therefore be expressed at the source level.
+
+The computational hot path is entirely in main.c, inside the per-iteration kernels
+that each touch all Ne = Nr*Nc elements.  The util/ files (graphics, resize, timer)
+perform only I/O and are unchanged.
+
+The two kernels that dominate runtime are:
+  A) The gradient / diffusion-coefficient kernel  (~20 ops/element)
+  B) The image update kernel                      (~8  ops/element)
+Both execute niter times over Ne elements, making every per-element saving multiply
+directly by niter*Ne.
+
+--------------------------------------------------------------------------------
+FILE: main.c — OPTIMIZED CHANGES
+--------------------------------------------------------------------------------
+
+1. SIMPLIFY ROW/COL DERIVATION — ELIMINATE BRANCH AND REDUNDANT ARITHMETIC
+   Affects: gradient kernel (lines ~325-372) and update kernel (lines ~374-396)
+
+   Original:
+       int row = (ei+1) % Nr - 1;
+       int col = (ei+1) / Nr + 1 - 1;   // the +1-1 cancels in the first kernel
+       if ((ei+1) % Nr == 0) {
+           row = Nr - 1;
+           col = col - 1;
+       }
+
+   Optimized:
+       int row = ei % Nr;
+       int col = ei / Nr;
+
+   Reason: The image is stored column-major: element at (row, col) has linear
+   index ei = col*Nr + row.  Therefore row = ei%Nr and col = ei/Nr exactly.
+   The original (ei+1)%Nr-1 formulation with a boundary branch is algebraically
+   equivalent but costs: one extra add (+1), one extra subtract (-1), a modulo
+   operation on (ei+1) instead of ei, and a conditional branch taken once every
+   Nr elements.  At -O0 the branch is fully evaluated each iteration.  The
+   simplified form removes the branch entirely (eliminating branch-prediction
+   overhead) and reduces from 5 operations to 2 per element in each kernel.
+
+2. CACHE iN[row], iS[row], jW[col], jE[col] AND Nr*col TO REDUCE REDUNDANT LOADS
+   Affects: gradient kernel
+
+   Original:
+       image[iN[row] + Nr*col]   // iN[row] loaded, Nr*col computed
+       image[iS[row] + Nr*col]   // iS[row] loaded, Nr*col computed again
+       image[row + Nr*jW[col]]   // jW[col] loaded
+       image[row + Nr*jE[col]]   // jE[col] loaded
+
+   Optimized:
+       int iN_row     = iN[row];
+       int iS_row     = iS[row];
+       int jW_col     = jW[col];
+       int jE_col     = jE[col];
+       int col_offset = Nr * col;
+       image[iN_row + col_offset]
+       image[iS_row + col_offset]
+       image[row + Nr * jW_col]
+       image[row + Nr * jE_col]
+
+   Reason: Nr*col is computed twice in the original (for N and S neighbors).
+   At -O0 this is two integer multiplies.  Caching as col_offset reduces it to
+   one.  Caching the iN/iS/jW/jE lookups eliminates repeated array loads; each
+   lookup is a memory read that at -O0 is not hoisted or CSE'd.  Net saving:
+   1 multiply + 4 redundant array loads per element in the gradient kernel.
+   The same col_offset and iS_row caching applies in the update kernel.
+
+3. PRECOMPUTE q0sqr*(1+q0sqr) ONCE PER ITERATION, NOT ONCE PER ELEMENT
+   Affects: gradient kernel
+
+   Original (inside the Ne-element parallel for):
+       d_den = (d_qsqr - q0sqr) / (q0sqr * (1+q0sqr));
+
+   Optimized (hoisted before the parallel for):
+       fp q0sqr_den = q0sqr * (1.0f + q0sqr);
+       // ...inside loop:
+       fp d_den2 = (d_qsqr - q0sqr) / q0sqr_den;
+
+   Reason: q0sqr is a scalar computed from the reduction and is constant for all
+   Ne elements in a given iteration.  At -O0, q0sqr*(1+q0sqr) is re-evaluated as
+   a multiply and an add for every one of the Ne elements.  Hoisting it outside
+   the parallel loop reduces it to a single computation per iteration, saving
+   Ne multiplies and Ne adds per iteration.
+
+4. USE DISTINCT VARIABLE NAMES FOR THE TWO SEPARATE d_den COMPUTATIONS
+   Affects: gradient kernel
+
+   Original:
+       fp d_den  = (fp)1 + ((fp)0.25*d_L);         // first d_den
+       fp d_qsqr = d_num / (d_den*d_den);
+       d_den = (d_qsqr-q0sqr) / (q0sqr*(1+q0sqr)); // d_den overwritten
+
+   Optimized:
+       fp d_den1 = 1.0f + (0.25f * d_L);
+       fp d_qsqr = d_num / (d_den1 * d_den1);
+       fp d_den2 = (d_qsqr - q0sqr) / q0sqr_den;
+
+   Reason: At -O0, reusing d_den forces a store-to-memory of the overwritten value
+   and a reload when d_den is read again for the d_c_loc computation.  Using
+   distinct names d_den1 and d_den2 allows each to occupy its own stack slot and
+   avoids the aliasing that causes the extra store/load round-trip at -O0.
+
+5. ELIMINATE DUPLICATE c[ei] LOAD AND REDUNDANT MULTIPLY IN UPDATE KERNEL
+   Affects: update kernel
+
+   Original:
+       fp d_cN = c[ei];   // north coefficient
+       fp d_cS = c[iS[row] + Nr*col];
+       fp d_cW = c[ei];   // west coefficient — same address as d_cN
+       fp d_cE = c[row + Nr*jE[col]];
+       fp d_D  = d_cN*dN[ei] + d_cS*dS[ei] + d_cW*dW[ei] + d_cE*dE[ei];
+
+   Optimized:
+       fp d_cNW = c[ei];              // loaded once
+       fp d_cS  = c[iS_row + col_offset];
+       fp d_cE  = c[row + Nr * jE_col];
+       fp d_D   = d_cNW*(dN[ei]+dW[ei]) + d_cS*dS[ei] + d_cE*dE[ei];
+
+   Reason: d_cN and d_cW are both c[ei] — the original loads the same memory
+   address twice and performs 4 multiplies.  Loading once and factoring
+   d_cNW*(dN+dW) reduces to 3 multiplies and 1 load, saving 1 memory load and
+   1 multiply per element.  At -O0 both savings are real instructions.
+
+6. PRECOMPUTE lambda*0.25 ONCE BEFORE THE ITERATION LOOP
+   Affects: update kernel
+
+   Original (inside the Ne-element parallel for, inside the niter loop):
+       image[ei] += (fp)0.25 * lambda * d_D;
+
+   Optimized (hoisted before the omp target data region):
+       fp lambda_quarter = (fp)0.25 * lambda;
+       // ...inside loop:
+       image[ei] += lambda_quarter * d_D;
+
+   Reason: lambda is a command-line parameter that never changes.  At -O0,
+   0.25*lambda is re-evaluated as a multiply for every one of the Ne*niter
+   element updates.  Hoisting it to a single precomputed constant eliminates
+   Ne*niter floating-point multiplies.
+
+7. CACHE image[ei] IN SUMS INITIALIZATION TO ELIMINATE DUPLICATE LOAD
+   Affects: sums/sums2 initialization kernel
+
+   Original:
+       sums[ei]  = image[ei];
+       sums2[ei] = image[ei] * image[ei];   // image[ei] loaded again
+
+   Optimized:
+       fp v      = image[ei];
+       sums[ei]  = v;
+       sums2[ei] = v * v;
+
+   Reason: At -O0 image[ei] is re-computed as a full memory load for sums2.
+   Caching in v reduces to one load per element, saving Ne loads per iteration.
+
+--------------------------------------------------------------------------------
+FILE: Makefile — CHANGES
+--------------------------------------------------------------------------------
+
+8. EXPLICIT -O0 AND DEVICE=cpu
+   Changed: OPTIMIZE=no, added -O0 explicitly to all compilation rules,
+   set DEVICE=cpu (selects -qopenmp CPU path instead of GPU offload flags).
+
+   Reason: The task requires -O0 compilation targeting CPU execution.
+   DEVICE=cpu activates -qopenmp so OpenMP target regions run on the host CPU
+   rather than attempting to offload to a GPU device.
+
+--------------------------------------------------------------------------------
+UNCHANGED FILES
+--------------------------------------------------------------------------------
+  main.h                           — only defines fp and NUMBER_THREADS
+  util/graphics/graphics.c/.h      — I/O only, not on critical path
+  util/graphics/resize.c/.h        — I/O only, not on critical path
+  util/timer/timer.c/.h            — timing utility only
+
+================================================================================
+Summary of optimization categories:
+  - Loop-invariant computation hoisting:   items 3, 6
+  - Redundant load elimination:            items 2, 5, 7
+  - Dead arithmetic elimination (branch):  item 1
+  - Variable naming to reduce store/load:  item 4
+  - Arithmetic strength reduction:         item 5 (4 muls → 3)
+================================================================================
