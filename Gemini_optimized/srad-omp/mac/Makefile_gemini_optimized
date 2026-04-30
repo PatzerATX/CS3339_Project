@@ -1,0 +1,30 @@
+CC        = g++
+OPTIMIZE  = no
+DEBUG       = no
+
+# Standard flags
+CFLAGS := -std=c++11 -Wall -march=armv8-a+simd -fopenmp
+
+# Linker flags
+LDFLAGS = -lm -fopenmp
+
+# Forced to -O0
+CFLAGS += -O0
+
+program = srad_gemini_optimized
+
+source = main_gemini_optimized.c \
+         util/graphics/graphics.c \
+         util/graphics/resize.c \
+         util/timer/timer.c
+
+obj = $(source:.c=.o)
+
+$(program): $(obj)
+	$(CC) $(CFLAGS) $(obj) -o $@ $(LDFLAGS)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+clean:
+	rm -f ./*.o $(program) *.pgm ./util/graphics/*.o ./util/timer/*.o

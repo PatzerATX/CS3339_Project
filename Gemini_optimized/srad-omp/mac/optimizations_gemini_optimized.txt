@@ -1,0 +1,28 @@
+Optimizations for SRAD (Gemini Optimized)
+Target: ARM64 Apple Silicon, Compiled at -O0
+
+1. CPU-Native OpenMP Parallelization:
+- Replaced the GPU-centric "OpenMP Target" and manual reduction kernel with standard CPU OpenMP (#pragma omp parallel for).
+- Used the `reduction` clause for the mean and variance calculations.
+- Reason: The GPU reduction kernel in the original code is extremely inefficient on a CPU due to thread synchronization overhead and shared memory emulation. Native OpenMP provides much faster parallelism for CPU execution.
+
+2. Cache-Line Alignment:
+- Used `aligned_alloc(128, ...)` for all major image buffers and index arrays.
+- Reason: Apple Silicon uses 128-byte cache lines. Aligning data ensures that memory accesses are optimized and avoids the performance penalty of cache line splits.
+
+3. Optimized Memory Access Patterns:
+- Structured the nested loops to iterate through columns in the outer loop and rows in the inner loop (matching the image layout).
+- Pre-calculated column base indices to avoid redundant multiplications inside the inner loops.
+- Reason: This improves spatial locality, making better use of the L1 and L2 caches and the unified memory architecture.
+
+4. Manual Loop Unrolling and Strength Reduction:
+- Simplified the complex conditional logic for row/column indexing.
+- Replaced the multi-pass GPU reduction with a single-pass parallel OpenMP reduction.
+- Reason: At -O0, the compiler will not perform loop unrolling or complex reduction optimizations. Manual implementation is required to reduce instruction count.
+
+5. Unified Memory Efficiency:
+- Eliminated all `map(to/from)` and `update` directives that were used for GPU offloading.
+- Reason: In a unified memory architecture, these operations are pure overhead. Direct memory access by the CPU is much faster.
+
+6. SIMD-Friendly Layout:
+- Organized the main kernels to process contiguous memory where possible, which is a prerequisite for any hardware-level SIMD execution (even if not explicitly using NEON intrinsics in this pass, the layout supports it).
